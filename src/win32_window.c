@@ -533,6 +533,9 @@ static void maximizeWindowManually(_GLFWwindow* window)
 //
 static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
+    static RECT border_thickness = { 4, 4, 4, 4 };
+    BOOL hasThickFrame = (BOOL)(GetWindowLongPtr(hWnd, GWL_STYLE) & WS_THICKFRAME);
+
     _GLFWwindow* window = GetPropW(hWnd, L"GLFW");
     if (!window)
     {
@@ -549,6 +552,31 @@ static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
                 // area static when the non-client area is scaled
                 if (wndconfig && wndconfig->scaleToMonitor)
                     EnableNonClientDpiScaling(hWnd);
+            }
+        }
+        else if (uMsg == WM_CREATE)
+        {
+            // Custom titlebar: when disabled and the window has a thick frame,
+            // force a frame change so the client area extends into the title bar.
+            if (!_glfw.hints.window.titlebar && hasThickFrame)
+            {
+                RECT size_rect;
+                GetWindowRect(hWnd, &size_rect);
+
+                SetWindowPos(
+                    hWnd, NULL,
+                    size_rect.left, size_rect.top,
+                    size_rect.right - size_rect.left, size_rect.bottom - size_rect.top,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE
+                );
+            }
+        }
+        else if (uMsg == WM_ACTIVATE)
+        {
+            if (!_glfw.hints.window.titlebar)
+            {
+                RECT title_bar_rect = { 0 };
+                InvalidateRect(hWnd, &title_bar_rect, FALSE);
             }
         }
 
@@ -1061,7 +1089,43 @@ static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
 
             window->win32.iconified = iconified;
             window->win32.maximized = maximized;
+
+            // Custom titlebar: force a frame change so the client area extends
+            // into the title bar area after a size change.
+            if (!_glfw.hints.window.titlebar && hasThickFrame)
+            {
+                RECT size_rect;
+                GetWindowRect(hWnd, &size_rect);
+                SetWindowPos(
+                    hWnd, NULL,
+                    size_rect.left, size_rect.top,
+                    size_rect.right - size_rect.left, size_rect.bottom - size_rect.top,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE
+                );
+            }
             return 0;
+        }
+
+        case WM_NCCALCSIZE:
+        {
+            if (_glfw.hints.window.titlebar || !hasThickFrame || !wParam)
+                break;
+
+            // For custom frames: shrink client area by border thickness so we
+            // can resize the window and still see borders.
+            const int resizeBorderX = GetSystemMetrics(SM_CXFRAME);
+            const int resizeBorderY = GetSystemMetrics(SM_CYFRAME);
+
+            NCCALCSIZE_PARAMS* params = (NCCALCSIZE_PARAMS*)lParam;
+            RECT* requestedClientRect = params->rgrc;
+
+            requestedClientRect->right  -= resizeBorderX;
+            requestedClientRect->left   += resizeBorderX;
+            requestedClientRect->bottom -= resizeBorderY;
+            // top intentionally left at +0 (see Cherno's fork for rationale)
+            requestedClientRect->top    += 0;
+
+            return WVR_ALIGNTOP | WVR_ALIGNLEFT;
         }
 
         case WM_MOVE:
@@ -1265,6 +1329,65 @@ static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
 
             DragFinish(drop);
             return 0;
+        }
+
+        case WM_ACTIVATE:
+        {
+            if (_glfw.hints.window.titlebar)
+                break;
+
+            RECT title_bar_rect = { 0 };
+            InvalidateRect(hWnd, &title_bar_rect, FALSE);
+            // Fall through to WM_NCHITTEST handling intentionally? No --
+            // WM_ACTIVATE is a separate message; just break.
+            break;
+        }
+
+        case WM_NCHITTEST:
+        {
+            if (_glfw.hints.window.titlebar || !hasThickFrame)
+                break;
+
+            // Hit test for custom frames
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hWnd, &pt);
+
+            // Check borders first
+            if (!window->win32.maximized)
+            {
+                RECT rc;
+                GetClientRect(hWnd, &rc);
+
+                const int verticalBorderSize = GetSystemMetrics(SM_CYFRAME);
+
+                enum { left = 1, top = 2, right = 4, bottom = 8 };
+                int hit = 0;
+                if (pt.x <= border_thickness.left)
+                    hit |= left;
+                if (pt.x >= rc.right - border_thickness.right)
+                    hit |= right;
+                if (pt.y <= border_thickness.top || pt.y < verticalBorderSize)
+                    hit |= top;
+                if (pt.y >= rc.bottom - border_thickness.bottom)
+                    hit |= bottom;
+
+                if (hit & top && hit & left)        return HTTOPLEFT;
+                if (hit & top && hit & right)       return HTTOPRIGHT;
+                if (hit & bottom && hit & left)     return HTBOTTOMLEFT;
+                if (hit & bottom && hit & right)    return HTBOTTOMRIGHT;
+                if (hit & left)                     return HTLEFT;
+                if (hit & top)                      return HTTOP;
+                if (hit & right)                    return HTRIGHT;
+                if (hit & bottom)                   return HTBOTTOM;
+            }
+
+            // Then ask client whether mouse is over the custom titlebar area
+            int titlebarHittest = 0;
+            _glfwInputTitleBarHitTest(window, pt.x, pt.y, &titlebarHittest);
+            if (titlebarHittest)
+                return HTCAPTION;
+
+            return HTCLIENT;
         }
     }
 
@@ -2006,6 +2129,11 @@ void _glfwSetWindowResizableWin32(_GLFWwindow* window, GLFWbool enabled)
 }
 
 void _glfwSetWindowDecoratedWin32(_GLFWwindow* window, GLFWbool enabled)
+{
+    updateWindowStyles(window);
+}
+
+void _glfwSetWindowTitlebarWin32(_GLFWwindow* window, GLFWbool enabled)
 {
     updateWindowStyles(window);
 }
